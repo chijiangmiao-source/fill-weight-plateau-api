@@ -77,3 +77,26 @@ class FillCheckResponse(BaseModel):
     tare_mg: int
     gross_mg: int | None
     net_mg: int | None
+
+
+class FillCheckBatchRequest(BaseModel):
+    """批量净灌装量判定请求。
+
+    checks 中每一项完整复用单次请求 :class:`FillCheckRequest` 的结构与
+    校验规则；长度 1 ~ 100。任一项非法（含时间戳不递增）时整批 422，
+    不产生任何部分裁决。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checks: list[FillCheckRequest] = Field(min_length=1, max_length=100)
+
+
+class FillCheckBatchResponse(BaseModel):
+    """批量净灌装量判定响应。
+
+    results 与请求 checks 同位置、同长度：results[i] 即 checks[i] 按
+    单次接口同一规则得出的裁决对象，下标语义可直接对应回原记录。
+    """
+
+    results: list[FillCheckResponse] = Field(min_length=1, max_length=100)

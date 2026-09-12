@@ -185,6 +185,40 @@ curl -s -X POST http://localhost:8000/v1/fill-check \
 }
 ```
 
+### `POST /v1/fill-check/batch`
+
+换线验收一次核对多瓶称重记录时批量提交。请求体仅含 `checks` 数组，长度 **1 ~ 100**；**每一项完整复用上面单次请求的全部结构与规则**（`samples` 50 ~ 20000、严格整数、可选 `calibration` / 采样断点 / 最短持续时间参数等），不新增任何判定结论。
+
+响应以 `results` 数组返回，与 `checks` **同位置、同长度**：`results[i]` 就是 `checks[i]` 按单次接口同一规则得出的裁决对象（结构与单次响应完全一致）。即使相邻记录内容相同也不去重、不重排，下标直接对应回原记录：
+
+```json
+{
+  "results": [
+    {"verdict": "pass", "platform_start_index": 20, "platform_end_index": 49,
+     "tare_mg": 1000, "gross_mg": 6102, "net_mg": 5102},
+    {"verdict": "fail", "platform_start_index": 20, "platform_end_index": 49,
+     "tare_mg": 1000, "gross_mg": 6102, "net_mg": 5102},
+    {"verdict": "indeterminate", "platform_start_index": null,
+     "platform_end_index": null, "tare_mg": 90, "gross_mg": null, "net_mg": null}
+  ]
+}
+```
+
+校验为**整批原子**语义：任一项字段非法或时间戳不递增时整批返回 422，**不产生任何部分结果**（响应无 `results`）。错误 `loc` 在原有字段路径前插入 `checks[i]`，同时携带批内下标与具体样本字段，例如：
+
+- 第 2 项（零基下标 1）的 `samples[5]` 时间戳不递增 →
+  `["body", "checks", 1, "samples", 5, "timestamp_ms"]`；
+- `checks[2]` 的 `samples[3].weight_mg` 为浮点数 →
+  `["body", "checks", 2, "samples", 3, "weight_mg"]`；
+- `checks[1]` 的校准高低点关系非法 →
+  `["body", "checks", 1, "calibration"]`；
+- `checks` 为空数组、超过 100 项或缺字段 → `["body", "checks"]`；
+- 顶层 / check 内 / 样本内多余字段分别定位到
+  `["body", "<字段>"]`、`["body", "checks", i, "<字段>"]`、
+  `["body", "checks", i, "samples", j, "<字段>"]`。
+
+单次与批量入口共享同一裁决服务函数，因此 30 点下限、4 毫克极差、最长优先及并列最早规则、原数组下标语义在两个入口完全一致；`checks[i]` 单独 POST 到 `/v1/fill-check` 的响应与批量响应中的 `results[i]` 逐项相同。
+
 ### `GET /health`
 
 存活探针，返回 `{"status": "ok"}`。
@@ -193,12 +227,14 @@ curl -s -X POST http://localhost:8000/v1/fill-check \
 
 ```
 ├── app/
-│   ├── main.py        # FastAPI 应用与路由
+│   ├── main.py        # FastAPI 应用与单次 / 批量路由
 │   ├── models.py      # Pydantic 请求/响应模型（严格校验）
+│   ├── service.py     # 共享裁决服务：校验、校准、皮重、平台、净重裁决
 │   └── core.py        # 核心算法：较小中位数、皮重、平台搜索（纯函数）
 ├── tests/
-│   ├── test_core.py   # 算法单元测试
-│   └── test_api.py    # API 集成测试（含校验错误定位）
+│   ├── test_core.py       # 算法单元测试
+│   ├── test_api.py        # 单次 API 集成测试（含校验错误定位）
+│   └── test_batch_api.py  # 批量 API 集成测试（同位置结果与整批原子校验）
 ├── requirements.txt   # 锁定版本的依赖清单
 ├── pytest.ini
 ├── Dockerfile         # python:3.12-slim
@@ -214,4 +250,4 @@ pytest -v                      # 本地
 docker compose run --rm verify # 容器内一次性验证
 ```
 
-测试覆盖：较小中位数奇偶、皮重只取前 20 样本、平台搜索起点（下标 ≥ 20）、最长优先与并列取下标最小、极差 4 通过 / 5 拒绝、29 点不足 / 30 点合格、尖峰打断区间、合格 / 不合格 / 不可判定三种结论、闭区间边界、全部字段的越界与类型错误定位；采样断点两侧不足 30 点、断点后独立长平台、阈值相等不切分及省略参数兼容；最短持续时间过滤下足够点数但时长不足判不可判定、时长恰好达标产生可复算结论、多候选过滤后选择与并列起点最早、非法参数（零 / 越界 / 布尔 / 非整数）定位到 `min_platform_duration_ms`、省略参数的多候选响应完全不变，以及与采样断点、两点校准的组合；两点校准的线性换算（含半毫克向上取整、校准点外推）、校准改变平台选择、校准关系非法定位到 `calibration`、修正重量越界定位到对应 `weight_mg` 且不部分裁决，以及校准与采样断点组合时的执行顺序。
+测试覆盖：较小中位数奇偶、皮重只取前 20 样本、平台搜索起点（下标 ≥ 20）、最长优先与并列取下标最小、极差 4 通过 / 5 拒绝、29 点不足 / 30 点合格、尖峰打断区间、合格 / 不合格 / 不可判定三种结论、闭区间边界、全部字段的越界与类型错误定位；采样断点两侧不足 30 点、断点后独立长平台、阈值相等不切分及省略参数兼容；最短持续时间过滤下足够点数但时长不足判不可判定、时长恰好达标产生可复算结论、多候选过滤后选择与并列起点最早、非法参数（零 / 越界 / 布尔 / 非整数）定位到 `min_platform_duration_ms`、省略参数的多候选响应完全不变，以及与采样断点、两点校准的组合；两点校准的线性换算（含半毫克向上取整、校准点外推）、校准改变平台选择、校准关系非法定位到 `calibration`、修正重量越界定位到对应 `weight_mg` 且不部分裁决，以及校准与采样断点组合时的执行顺序；批量接口中合格 / 不合格 / 不可判定按输入顺序同位置返回且与逐项调用单次接口结果一致（含可选参数与校准、1 ~ 100 上下限），中间项时间戳错误定位到 `checks[1]` 的具体样本、批内任一字段非法 / 空数组 / 超上限 / 各级多余字段均按同一结构定位且整批 422 不产生部分结果，以及重构后原 `POST /v1/fill-check` 的成功响应与错误定位不变。
