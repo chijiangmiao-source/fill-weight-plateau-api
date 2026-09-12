@@ -47,9 +47,14 @@ def fill_check(request: FillCheckRequest) -> FillCheckResponse:
             )
 
     weights = [s.weight_mg for s in samples]
+    timestamps = [s.timestamp_ms for s in samples]
     tare_mg = compute_tare_mg(weights)
 
-    platform = find_platform(weights)
+    platform = find_platform(
+        weights,
+        timestamps_ms=timestamps,
+        max_sample_gap_ms=request.max_sample_gap_ms,
+    )
     if platform is None:
         # 无合格平台：明确返回不可判定，不猜任何值
         return FillCheckResponse(

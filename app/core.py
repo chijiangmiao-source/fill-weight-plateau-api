@@ -29,11 +29,19 @@ def compute_tare_mg(weights: list[int]) -> int:
     return lower_median(weights[:TARE_SAMPLE_COUNT])
 
 
-def find_platform(weights: list[int]) -> tuple[int, int] | None:
+def find_platform(
+    weights: list[int],
+    timestamps_ms: list[int] | None = None,
+    max_sample_gap_ms: int | None = None,
+) -> tuple[int, int] | None:
     """在下标 >= 20 的后续样本中搜索真实平台。
 
     平台定义：连续区间，点数 >= 30，且区间内 最大重量 - 最小重量 <= 4 毫克。
     选择点数最多者；点数并列时选择起始下标最小者。
+
+    当提供 timestamps_ms 与 max_sample_gap_ms 时，相邻样本时间差严格大于
+    max_sample_gap_ms 视为采样断点（灌装线停顿后继续上报同批数据）。
+    搜索窗口在断点处整体重置，平台只能位于单个连续片段内，绝不跨越空档。
 
     返回 (起始下标, 结束下标)，均为原请求样本数组的零基下标且包含两端；
     不存在合格平台时返回 None。
@@ -47,6 +55,18 @@ def find_platform(weights: list[int]) -> tuple[int, int] | None:
     best_end = -1
 
     for right in range(TARE_SAMPLE_COUNT, n):
+        # 采样断点：right 是断点后的第一个样本，丢弃断点前的全部窗口状态，
+        # 从 right 重新开段，保证任何平台都不跨越时间空档。
+        if (
+            max_sample_gap_ms is not None
+            and timestamps_ms is not None
+            and right > TARE_SAMPLE_COUNT
+            and timestamps_ms[right] - timestamps_ms[right - 1] > max_sample_gap_ms
+        ):
+            left = right
+            min_q.clear()
+            max_q.clear()
+
         w = weights[right]
         while min_q and weights[min_q[-1]] >= w:
             min_q.pop()

@@ -13,6 +13,8 @@ TimestampMs = Annotated[int, Field(strict=True, ge=0, le=86_400_000)]
 WeightMg = Annotated[int, Field(strict=True, ge=0, le=500_000)]
 TargetNetMg = Annotated[int, Field(strict=True, ge=1, le=500_000)]
 ToleranceMg = Annotated[int, Field(strict=True, ge=0, le=50_000)]
+# 相邻样本时间差超过该值即视为搜索断点；零值非法（0 会把任意相邻样本都切成断点）
+MaxSampleGapMs = Annotated[int, Field(strict=True, ge=1, le=86_000_000)]
 
 
 class Sample(BaseModel):
@@ -32,6 +34,7 @@ class FillCheckRequest(BaseModel):
     samples: list[Sample] = Field(min_length=50, max_length=20_000)
     target_net_mg: TargetNetMg
     tolerance_mg: ToleranceMg
+    max_sample_gap_ms: MaxSampleGapMs | None = Field(default=None)
 
 
 class Verdict(str, Enum):

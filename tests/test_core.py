@@ -98,3 +98,72 @@ class TestFindPlatform:
         weights = [1000] * 20 + [2000] * 29 + [88888] + [2000] * 29
         assert len(weights) == 79
         assert find_platform(weights) is None
+
+
+def timestamps_with_gap(
+    n: int, gap_after: int, step: int = 100, big_gap: int = 100_000
+) -> list[int]:
+    """构造 0 起严格递增时间戳，在 gap_after 与 gap_after+1 之间插入 big_gap。"""
+    ts = [0]
+    for i in range(1, n):
+        ts.append(ts[-1] + (big_gap if i == gap_after + 1 else step))
+    return ts
+
+
+class TestFindPlatformWithSampleGap:
+    def test_gap_splits_region_into_two_29_point_segments(self):
+        # 下标 20..77 共 58 个同值点，时间断点位于 48/49 之间，
+        # 断点两侧各 29 点，均不足 30 点 -> 不可判定
+        weights = [1000] * 20 + [2000] * 58
+        assert len(weights) == 78
+        ts = timestamps_with_gap(len(weights), gap_after=48)
+        assert find_platform(weights, ts, max_sample_gap_ms=1000) is None
+
+    def test_without_gap_param_same_region_is_one_platform(self):
+        # 同一份样本，不传时间断点参数时不切分，58 点整体成为平台
+        weights = [1000] * 20 + [2000] * 58
+        ts = timestamps_with_gap(len(weights), gap_after=48)
+        assert find_platform(weights, ts) == (20, 77)
+        assert find_platform(weights, ts, max_sample_gap_ms=None) == (20, 77)
+
+    def test_independent_long_platform_after_gap_is_selected(self):
+        # 断点前 29 点（不足），断点后 40 点独立长平台 -> 选 (49, 88)
+        weights = [1000] * 20 + [2000] * 29 + [2000] * 40
+        assert len(weights) == 89
+        ts = timestamps_with_gap(len(weights), gap_after=48)
+        assert find_platform(weights, ts, max_sample_gap_ms=1000) == (49, 88)
+
+    def test_gap_equal_to_threshold_does_not_break(self):
+        # 相邻时间差“超过”阈值才算断点：恰好相等不切分
+        weights = [1000] * 20 + [2000] * 58
+        ts = timestamps_with_gap(len(weights), gap_after=48, big_gap=1000)
+        assert find_platform(weights, ts, max_sample_gap_ms=1000) == (20, 77)
+
+    def test_gap_one_over_threshold_breaks(self):
+        weights = [1000] * 20 + [2000] * 58
+        ts = timestamps_with_gap(len(weights), gap_after=48, big_gap=1001)
+        assert find_platform(weights, ts, max_sample_gap_ms=1000) is None
+
+    def test_normal_step_below_threshold_does_not_break(self):
+        weights = [1000] * 20 + [2000] * 30
+        ts = timestamps_with_gap(len(weights), gap_after=48, step=100, big_gap=100)
+        assert find_platform(weights, ts, max_sample_gap_ms=1000) == (20, 49)
+
+    def test_longest_segment_wins_across_multiple_gaps(self):
+        # 断点把后续样本切成 30 / 40 两段，跨段拼凑被禁止 -> 选 40 点段
+        weights = [1000] * 20 + [2000] * 30 + [2000] * 40
+        assert len(weights) == 90
+        ts = timestamps_with_gap(len(weights), gap_after=49)
+        assert find_platform(weights, ts, max_sample_gap_ms=1000) == (50, 89)
+
+    def test_tie_between_segments_keeps_earliest_start(self):
+        # 两个片段各 30 点且重量极差互不兼容，并列时选起点更早的片段
+        weights = [1000] * 20 + [2000] * 30 + [3000] * 30
+        ts = timestamps_with_gap(len(weights), gap_after=49)
+        assert find_platform(weights, ts, max_sample_gap_ms=1000) == (20, 49)
+
+    def test_gap_between_tare_and_search_region_has_no_effect(self):
+        # 断点位于下标 19/20 之间：搜索域从 20 开始，不影响平台判定
+        weights = [1000] * 20 + [2000] * 30
+        ts = timestamps_with_gap(len(weights), gap_after=19)
+        assert find_platform(weights, ts, max_sample_gap_ms=1000) == (20, 49)

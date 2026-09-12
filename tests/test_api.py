@@ -20,15 +20,30 @@ def make_payload(
     tolerance: int = 10,
     start_ts: int = 0,
     step: int = 100,
+    max_sample_gap_ms: int | None = None,
+    timestamps: list[int] | None = None,
 ) -> dict:
-    return {
+    if timestamps is None:
+        timestamps = [start_ts + i * step for i in range(len(weights))]
+    payload = {
         "samples": [
-            {"timestamp_ms": start_ts + i * step, "weight_mg": w}
-            for i, w in enumerate(weights)
+            {"timestamp_ms": ts, "weight_mg": w}
+            for w, ts in zip(weights, timestamps)
         ],
         "target_net_mg": target,
         "tolerance_mg": tolerance,
     }
+    if max_sample_gap_ms is not None:
+        payload["max_sample_gap_ms"] = max_sample_gap_ms
+    return payload
+
+
+def gapped_timestamps(n: int, gap_after: int, step: int = 100, big_gap: int = 100_000) -> list[int]:
+    """严格递增时间戳，在 gap_after 与 gap_after+1 之间插入 big_gap 长空档。"""
+    ts = [0]
+    for i in range(1, n):
+        ts.append(ts[-1] + (big_gap if i == gap_after + 1 else step))
+    return ts
 
 
 class TestHealth:
@@ -124,6 +139,106 @@ class TestVerdict:
         first = client.post(URL, json=payload).json()
         second = client.post(URL, json=payload).json()
         assert first == second
+
+
+class TestSampleGap:
+    def test_gap_splits_stable_region_both_sides_under_30(self):
+        # 下标 20..77 共 58 个恒值点，断点在 48/49 之间，两侧各 29 点
+        weights = [1000] * 20 + [6100] * 58
+        assert len(weights) == 78
+        ts = gapped_timestamps(len(weights), gap_after=48)
+        resp = client.post(URL, json=make_payload(weights, timestamps=ts, max_sample_gap_ms=1000))
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "indeterminate",
+            "platform_start_index": None,
+            "platform_end_index": None,
+            "tare_mg": 1000,
+            "gross_mg": None,
+            "net_mg": None,
+        }
+
+    def test_independent_long_platform_after_gap_is_selected(self):
+        # 断点前 29 点不足，断点后 40 点独立平台 (49, 88)，毛重 6100
+        weights = [1000] * 20 + [6100] * 29 + [6100] * 40
+        assert len(weights) == 89
+        ts = gapped_timestamps(len(weights), gap_after=48)
+        resp = client.post(
+            URL, json=make_payload(weights, timestamps=ts, target=5100, tolerance=10,
+                                   max_sample_gap_ms=1000)
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 49,
+            "platform_end_index": 88,
+            "tare_mg": 1000,
+            "gross_mg": 6100,
+            "net_mg": 5100,
+        }
+
+    def test_gap_threshold_exactly_equal_does_not_split(self):
+        # 空档恰好等于阈值（不算“超过”），58 点整体成为平台
+        weights = [1000] * 20 + [6100] * 58
+        ts = gapped_timestamps(len(weights), gap_after=48, big_gap=1000)
+        resp = client.post(
+            URL, json=make_payload(weights, timestamps=ts, max_sample_gap_ms=1000)
+        )
+        body = resp.json()
+        assert body["verdict"] == "pass"
+        assert (body["platform_start_index"], body["platform_end_index"]) == (20, 77)
+
+    def test_omitted_param_keeps_pass_verdict_unchanged(self):
+        # 省略参数：即使存在超长空档也不切分，pass 结论与原结果逐项一致
+        weights = [1000] * 20 + [6100] * 58
+        ts = gapped_timestamps(len(weights), gap_after=48)
+        payload = make_payload(weights, timestamps=ts)
+        assert "max_sample_gap_ms" not in payload
+        resp = client.post(URL, json=payload)
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 20,
+            "platform_end_index": 77,
+            "tare_mg": 1000,
+            "gross_mg": 6100,
+            "net_mg": 5100,
+        }
+
+    def test_omitted_param_keeps_fail_verdict_unchanged(self):
+        payload = make_payload(PASSING_WEIGHTS, target=6000, tolerance=10)
+        resp = client.post(URL, json=payload)
+        body = resp.json()
+        assert body["verdict"] == "fail"
+        assert (body["platform_start_index"], body["platform_end_index"]) == (20, 49)
+        assert body["net_mg"] == 5102
+
+    def test_omitted_param_keeps_indeterminate_verdict_unchanged(self):
+        weights = [i * 10 for i in range(50)]
+        resp = client.post(URL, json=make_payload(weights))
+        assert resp.json() == {
+            "verdict": "indeterminate",
+            "platform_start_index": None,
+            "platform_end_index": None,
+            "tare_mg": 90,
+            "gross_mg": None,
+            "net_mg": None,
+        }
+
+    def test_explicit_null_param_equivalent_to_omitted(self):
+        payload = make_payload(PASSING_WEIGHTS)
+        payload["max_sample_gap_ms"] = None
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["verdict"] == "pass"
+        assert (body["platform_start_index"], body["platform_end_index"]) == (20, 49)
+
+    def test_upper_bound_accepted(self):
+        resp = client.post(
+            URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms=86_000_000)
+        )
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "pass"
 
 
 class TestValidation:
@@ -228,6 +343,55 @@ class TestValidation:
         resp = client.post(URL, json=payload)
         assert resp.status_code == 422
         assert resp.json()["detail"][0]["loc"] == ["body", "unexpected"]
+
+    def test_max_sample_gap_zero_rejected_and_located(self):
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms=0))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "max_sample_gap_ms"]
+
+    def test_max_sample_gap_negative_rejected_and_located(self):
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms=-1))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "max_sample_gap_ms"]
+
+    def test_max_sample_gap_above_limit_rejected_and_located(self):
+        resp = client.post(
+            URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms=86_000_001)
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "max_sample_gap_ms"]
+
+    def test_max_sample_gap_bool_true_rejected_and_located(self):
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms=True))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "max_sample_gap_ms"]
+
+    def test_max_sample_gap_bool_false_rejected_and_located(self):
+        # False 既不能冒充整数，也不能冒充缺省
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms=False))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "max_sample_gap_ms"]
+
+    def test_max_sample_gap_float_rejected_and_located(self):
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms=1.5))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "max_sample_gap_ms"]
+
+    def test_max_sample_gap_float_whole_number_rejected(self):
+        # 1.0 是 JSON 浮点数而非整数，严格模式同样拒绝
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms=1.0))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "max_sample_gap_ms"]
+
+    def test_max_sample_gap_string_rejected_and_located(self):
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms="1000"))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "max_sample_gap_ms"]
+
+    def test_max_sample_gap_array_rejected_and_located(self):
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, max_sample_gap_ms=[1000]))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "max_sample_gap_ms"]
 
     def test_error_response_is_structured(self):
         resp = client.post(URL, json={"samples": []})
