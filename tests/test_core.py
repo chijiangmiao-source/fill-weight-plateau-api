@@ -208,3 +208,91 @@ class TestFindPlatformWithSampleGap:
         weights = [1000] * 20 + [2000] * 30
         ts = timestamps_with_gap(len(weights), gap_after=19)
         assert find_platform(weights, ts, max_sample_gap_ms=1000) == (20, 49)
+
+
+def uniform_timestamps(n: int, step: int) -> list[int]:
+    """等间隔严格递增时间戳：0, step, 2*step, ..."""
+    return [i * step for i in range(n)]
+
+
+class TestFindPlatformWithMinDuration:
+    def test_30_points_dense_sampling_duration_too_short(self):
+        # 30 个点以 1ms 间隔高频采样：点数 30、极差 0 均合格，
+        # 但首尾时间戳之差仅 29ms，门槛 30ms -> 伪平台被过滤
+        weights = [1000] * 20 + [2000] * 30
+        ts = uniform_timestamps(len(weights), step=1)
+        assert find_platform(weights, ts, min_platform_duration_ms=30) is None
+
+    def test_duration_exactly_equal_to_threshold_is_accepted(self):
+        # 首尾之差 29ms 恰好等于门槛：闭区间比较，达标
+        weights = [1000] * 20 + [2000] * 30
+        ts = uniform_timestamps(len(weights), step=1)
+        assert find_platform(weights, ts, min_platform_duration_ms=29) == (20, 49)
+
+    def test_duration_one_below_threshold_is_rejected(self):
+        weights = [1000] * 20 + [2000] * 30
+        ts = uniform_timestamps(len(weights), step=100)  # 跨度 2900ms
+        assert find_platform(weights, ts, min_platform_duration_ms=2901) is None
+
+    def test_duration_threshold_does_not_change_result_when_omitted(self):
+        # 同一份高频数据，省略时长门槛时仍按点数规则选中平台
+        weights = [1000] * 20 + [2000] * 30
+        ts = uniform_timestamps(len(weights), step=1)
+        assert find_platform(weights, ts) == (20, 49)
+        assert find_platform(weights, ts, min_platform_duration_ms=None) == (20, 49)
+
+    def test_duration_filter_keeps_long_sparse_platform_over_dense_longer_one(self):
+        # 片段 A：下标 20..54 共 35 点，1ms 密集采样，跨度仅 34ms（点数最多但伪平台）
+        # 下标 55 为尖峰打断窗口
+        # 片段 B：下标 56..85 共 30 点，1000ms 稀疏采样，跨度 29000ms
+        weights = [1000] * 20 + [2000] * 35 + [99999] + [3000] * 30
+        assert len(weights) == 86
+        ts = list(range(56)) + [1055 + 1000 * k for k in range(30)]
+        assert ts[54] - ts[20] == 34
+        assert ts[85] - ts[56] == 29000
+        # 无门槛：点数最多的 A 胜出
+        assert find_platform(weights, ts) == (20, 54)
+        # 门槛 1000ms：A 持续时间不足被过滤，只剩 B
+        assert find_platform(weights, ts, min_platform_duration_ms=1000) == (56, 85)
+
+    def test_passing_candidates_still_ranked_by_point_count(self):
+        # 两个稀疏长片段：A 30 点、B 40 点，时长都达标 -> 仍选点数最多的 B
+        weights = [1000] * 20 + [2000] * 30 + [99999] + [3000] * 40
+        assert len(weights) == 91
+        ts = [i * 1000 for i in range(51)] + [60000 + 1000 * k for k in range(40)]
+        assert find_platform(weights, ts, min_platform_duration_ms=1000) == (51, 90)
+
+    def test_passing_candidates_same_points_keeps_earliest_start(self):
+        # 两个稀疏长片段各 30 点且时长都达标：并列时保留起点更早的 A
+        weights = [1000] * 20 + [2000] * 30 + [99999] + [3000] * 30
+        assert len(weights) == 81
+        ts = [i * 1000 for i in range(51)] + [60000 + 1000 * k for k in range(30)]
+        assert find_platform(weights, ts, min_platform_duration_ms=1000) == (20, 49)
+
+    def test_filter_timestamps_are_actual_sample_times_not_index_span(self):
+        # 平台 30 点下标跨度 29，但时间戳间隔放大到 100ms -> 实际跨度 2900ms
+        weights = [1000] * 20 + [2000] * 30
+        ts = uniform_timestamps(len(weights), step=100)
+        assert find_platform(weights, ts, min_platform_duration_ms=2900) == (20, 49)
+
+    def test_min_duration_without_timestamps_defensively_rejects(self):
+        # 路由始终提供时间戳；核心在缺少时间戳时不臆测时长
+        weights = [1000] * 20 + [2000] * 30
+        assert find_platform(weights, min_platform_duration_ms=1) is None
+
+    def test_min_duration_combines_with_sample_gap_reset(self):
+        # 时间断点把后续样本切成两段：断点前 35 个密集点（跨度 34ms），
+        # 断点后 30 个稀疏点（跨度 29000ms）。两个开关同时生效时只选 B。
+        weights = [1000] * 20 + [2000] * 35 + [2000] * 30
+        assert len(weights) == 85
+        # 0..54 间隔 1ms；54->55 插入长空档；55..84 间隔 1000ms
+        ts = list(range(55)) + [100_000 + 1000 * k for k in range(30)]
+        assert ts[55] - ts[54] > 1000
+        assert ts[54] - ts[20] == 34
+        assert ts[84] - ts[55] == 29000
+        assert find_platform(
+            weights,
+            ts,
+            max_sample_gap_ms=1000,
+            min_platform_duration_ms=1000,
+        ) == (55, 84)

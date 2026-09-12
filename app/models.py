@@ -15,6 +15,8 @@ TargetNetMg = Annotated[int, Field(strict=True, ge=1, le=500_000)]
 ToleranceMg = Annotated[int, Field(strict=True, ge=0, le=50_000)]
 # 相邻样本时间差超过该值即视为搜索断点；零值非法（0 会把任意相邻样本都切成断点）
 MaxSampleGapMs = Annotated[int, Field(strict=True, ge=1, le=86_000_000)]
+# 候选平台首尾时间戳之差（毫秒）的下限，用于过滤高频采样下的伪平台；零值非法
+MinPlatformDurationMs = Annotated[int, Field(strict=True, ge=1, le=86_000_000)]
 
 
 class Sample(BaseModel):
@@ -50,6 +52,7 @@ class FillCheckRequest(BaseModel):
     target_net_mg: TargetNetMg
     tolerance_mg: ToleranceMg
     max_sample_gap_ms: MaxSampleGapMs | None = Field(default=None)
+    min_platform_duration_ms: MinPlatformDurationMs | None = Field(default=None)
     calibration: Calibration | None = None
 
 

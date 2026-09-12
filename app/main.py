@@ -117,6 +117,7 @@ def fill_check(request: FillCheckRequest) -> FillCheckResponse:
         weights,
         timestamps_ms=timestamps,
         max_sample_gap_ms=request.max_sample_gap_ms,
+        min_platform_duration_ms=request.min_platform_duration_ms,
     )
     if platform is None:
         # 无合格平台：明确返回不可判定，不猜任何值

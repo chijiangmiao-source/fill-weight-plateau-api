@@ -66,6 +66,7 @@ def find_platform(
     weights: list[int],
     timestamps_ms: list[int] | None = None,
     max_sample_gap_ms: int | None = None,
+    min_platform_duration_ms: int | None = None,
 ) -> tuple[int, int] | None:
     """在下标 >= 20 的后续样本中搜索真实平台。
 
@@ -75,6 +76,11 @@ def find_platform(
     当提供 timestamps_ms 与 max_sample_gap_ms 时，相邻样本时间差严格大于
     max_sample_gap_ms 视为采样断点（灌装线停顿后继续上报同批数据）。
     搜索窗口在断点处整体重置，平台只能位于单个连续片段内，绝不跨越空档。
+
+    当提供 timestamps_ms 与 min_platform_duration_ms 时，候选平台还必须满足
+    首尾时间戳之差 >= min_platform_duration_ms。高频采样下 30 个点可能只
+    覆盖极短瞬间，该时长门槛用于过滤这种伪平台；先按点数与极差形成候选，
+    再过滤持续时间不足者。
 
     返回 (起始下标, 结束下标)，均为原请求样本数组的零基下标且包含两端；
     不存在合格平台时返回 None。
@@ -120,7 +126,17 @@ def find_platform(
         # 区间长度每次最多增加 1，因此只在严格更优时更新，
         # 即可保证点数并列时保留起始下标最小者。
         length = right - left + 1
-        if length > best_len:
+        # 持续时间门槛：[left, right] 是以 right 结尾起点最早的合法区间，
+        # 因而时长也最长；它都不达标时，任何同尾后缀只会更短，无需再试。
+        duration_ok = (
+            min_platform_duration_ms is None
+            or (
+                timestamps_ms is not None
+                and timestamps_ms[right] - timestamps_ms[left]
+                >= min_platform_duration_ms
+            )
+        )
+        if length >= MIN_PLATFORM_POINTS and duration_ok and length > best_len:
             best_len = length
             best_start = left
             best_end = right

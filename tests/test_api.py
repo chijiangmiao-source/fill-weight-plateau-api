@@ -1,5 +1,6 @@
 """API 集成测试：通过 TestClient 走完整的请求-响应链路。"""
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -23,6 +24,7 @@ def make_payload(
     max_sample_gap_ms: int | None = None,
     timestamps: list[int] | None = None,
     calibration: dict | None = None,
+    min_platform_duration_ms: int | None = None,
 ) -> dict:
     if timestamps is None:
         timestamps = [start_ts + i * step for i in range(len(weights))]
@@ -38,6 +40,8 @@ def make_payload(
         payload["max_sample_gap_ms"] = max_sample_gap_ms
     if calibration is not None:
         payload["calibration"] = calibration
+    if min_platform_duration_ms is not None:
+        payload["min_platform_duration_ms"] = min_platform_duration_ms
     return payload
 
 
@@ -255,6 +259,200 @@ class TestSampleGap:
         )
         assert resp.status_code == 200
         assert resp.json()["verdict"] == "pass"
+
+
+class TestMinPlatformDuration:
+    # 高频采样样本：平台段 30 个点以 1ms 间隔采集，下标 20..49 的首尾
+    # 时间戳之差仅 29ms（点数与极差均合格的伪平台）。
+    DENSE_TIMESTAMPS = list(range(50))
+
+    def test_enough_points_but_too_short_is_indeterminate(self):
+        # 验收组 1：足够点数（30）、极差 4，但时长 29ms < 门槛 30ms -> 不可判定。
+        # 响应与原有不可判定结构逐项一致，不泄露任何候选平台信息。
+        payload = make_payload(
+            PASSING_WEIGHTS,
+            timestamps=self.DENSE_TIMESTAMPS,
+            min_platform_duration_ms=30,
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "indeterminate",
+            "platform_start_index": None,
+            "platform_end_index": None,
+            "tare_mg": 1000,
+            "gross_mg": None,
+            "net_mg": None,
+        }
+
+    def test_duration_one_below_threshold_all_candidates_too_short(self):
+        # 平台跨度 2900ms（100ms 步长），门槛 2901ms：无候选存活，结构同上
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, min_platform_duration_ms=2901))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["verdict"] == "indeterminate"
+        assert body["platform_start_index"] is None
+        assert body["gross_mg"] is None
+        assert body["net_mg"] is None
+        assert body["tare_mg"] == 1000
+
+    def test_duration_exactly_meets_threshold_gives_recomputable_pass(self):
+        # 验收组 2：首尾之差恰好 29ms == 门槛，候选合格；
+        # 毛重为 6100..6104 各 6 个的较小中位数（排序下标 14）= 6102，
+        # 皮重 1000，净重 5102，落入 [5090, 5110]，结论可逐样本复算。
+        payload = make_payload(
+            PASSING_WEIGHTS,
+            timestamps=self.DENSE_TIMESTAMPS,
+            min_platform_duration_ms=29,
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 20,
+            "platform_end_index": 49,
+            "tare_mg": 1000,
+            "gross_mg": 6102,
+            "net_mg": 5102,
+        }
+
+    def test_two_candidates_filter_picks_longer_duration_one(self):
+        # 两个等点数候选：A=(20,49) 时长 2900ms，B=(51,80) 时长 29000ms。
+        # 门槛 5000ms 过滤 A 后只剩 B；毛重 6200、净重 5200。
+        weights = [1000] * 20 + [6100] * 30 + [99999] + [6200] * 30
+        assert len(weights) == 81
+        timestamps = [i * 100 for i in range(51)] + [60000 + 1000 * k for k in range(30)]
+        assert timestamps[49] - timestamps[20] == 2900
+        assert timestamps[80] - timestamps[51] == 29000
+        resp = client.post(
+            URL,
+            json=make_payload(
+                weights, target=5200, tolerance=0, timestamps=timestamps,
+                min_platform_duration_ms=5000,
+            ),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 51,
+            "platform_end_index": 80,
+            "tare_mg": 1000,
+            "gross_mg": 6200,
+            "net_mg": 5200,
+        }
+        # 门槛抬高到两个候选都不达标 -> 不可判定，不泄露候选
+        resp_all_short = client.post(
+            URL,
+            json=make_payload(
+                weights, target=5200, tolerance=0, timestamps=timestamps,
+                min_platform_duration_ms=30000,
+            ),
+        )
+        assert resp_all_short.json() == {
+            "verdict": "indeterminate",
+            "platform_start_index": None,
+            "platform_end_index": None,
+            "tare_mg": 1000,
+            "gross_mg": None,
+            "net_mg": None,
+        }
+        # A 的时长恰好达标：并列仍按起点最早选 A
+        resp_exact = client.post(
+            URL,
+            json=make_payload(
+                weights, target=5100, tolerance=0, timestamps=timestamps,
+                min_platform_duration_ms=2900,
+            ),
+        )
+        assert (resp_exact.json()["platform_start_index"],
+                resp_exact.json()["platform_end_index"]) == (20, 49)
+
+    def test_omitted_param_multi_candidate_response_identical(self):
+        # 验收组 4：多候选请求省略 min_platform_duration_ms 时，
+        # 仍按点数最多、起点最早选中原平台 A，响应与不带该参数时完全一致。
+        weights = [1000] * 20 + [6100] * 30 + [99999] + [6200] * 30
+        timestamps = [i * 100 for i in range(51)] + [60000 + 1000 * k for k in range(30)]
+        payload = make_payload(weights, target=5100, tolerance=10, timestamps=timestamps)
+        assert "min_platform_duration_ms" not in payload
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 20,
+            "platform_end_index": 49,
+            "tare_mg": 1000,
+            "gross_mg": 6100,
+            "net_mg": 5100,
+        }
+
+    def test_omitted_param_single_platform_response_byte_identical_to_before(self):
+        # 经典样本省略新参数：与引入该功能前的响应逐项相同
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS))
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 20,
+            "platform_end_index": 49,
+            "tare_mg": 1000,
+            "gross_mg": 6102,
+            "net_mg": 5102,
+        }
+
+    def test_explicit_null_equivalent_to_omitted(self):
+        payload = make_payload(PASSING_WEIGHTS, min_platform_duration_ms=None)
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert (resp.json()["platform_start_index"],
+                resp.json()["platform_end_index"]) == (20, 49)
+
+    def test_upper_bound_accepted(self):
+        # 86000000 合法：此时所有候选必然不达标（时间戳最大跨度 86400000，
+        # 但平台起点在样本 20 之后，跨度达不到门槛）-> 不可判定而非 422
+        resp = client.post(
+            URL, json=make_payload(PASSING_WEIGHTS, min_platform_duration_ms=86_000_000)
+        )
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "indeterminate"
+
+    def test_applies_with_calibration_and_sample_gap(self):
+        # 与校准、采样断点组合：高频伪平台经时长过滤后，选择断点后稀疏长平台
+        weights = [1000] * 20 + [6100] * 35 + [6100] * 30
+        assert len(weights) == 85
+        timestamps = list(range(55)) + [100_000 + 1000 * k for k in range(30)]
+        resp = client.post(
+            URL,
+            json=make_payload(
+                weights, target=5100, tolerance=0, timestamps=timestamps,
+                max_sample_gap_ms=1000, min_platform_duration_ms=1000,
+            ),
+        )
+        assert resp.status_code == 200
+        assert (resp.json()["platform_start_index"],
+                resp.json()["platform_end_index"]) == (55, 84)
+
+
+class TestMinPlatformDurationValidation:
+    # 验收组 3：零、越界、布尔、非整数均 422，定位到 min_platform_duration_ms
+    @pytest.mark.parametrize("bad_value", [0, -1, 86_000_001, True, False, 1.5, 1.0, "1000", [1000]])
+    def test_invalid_values_rejected_and_located(self, bad_value):
+        resp = client.post(
+            URL, json=make_payload(PASSING_WEIGHTS, min_platform_duration_ms=bad_value)
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "min_platform_duration_ms"]
+
+    def test_bool_false_not_treated_as_omitted(self):
+        resp = client.post(
+            URL, json=make_payload(PASSING_WEIGHTS, min_platform_duration_ms=False)
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "min_platform_duration_ms"]
+
+    def test_extra_field_still_rejected(self):
+        payload = make_payload(PASSING_WEIGHTS)
+        payload["unexpected"] = 1
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "unexpected"]
 
 
 class TestCalibration:
