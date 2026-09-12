@@ -7,7 +7,14 @@ GET  /health         存活探针
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 
-from app.core import compute_tare_mg, find_platform, lower_median
+from app.core import (
+    WEIGHT_MAX_MG,
+    WEIGHT_MIN_MG,
+    calibrate_weight_mg,
+    compute_tare_mg,
+    find_platform,
+    lower_median,
+)
 from app.models import FillCheckRequest, FillCheckResponse, Verdict
 
 app = FastAPI(
@@ -46,8 +53,64 @@ def fill_check(request: FillCheckRequest) -> FillCheckResponse:
                 ]
             )
 
-    weights = [s.weight_mg for s in samples]
     timestamps = [s.timestamp_ms for s in samples]
+
+    # 两点校准关系校验：测量高点、参考高点必须分别严格大于各自低点
+    calibration = request.calibration
+    if calibration is not None and (
+        calibration.measured_high_mg <= calibration.measured_low_mg
+        or calibration.reference_high_mg <= calibration.reference_low_mg
+    ):
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ["body", "calibration"],
+                    "msg": (
+                        "calibration high points must be strictly greater than "
+                        "their own low points: "
+                        f"measured_high_mg={calibration.measured_high_mg} "
+                        f"<= measured_low_mg={calibration.measured_low_mg} or "
+                        f"reference_high_mg={calibration.reference_high_mg} "
+                        f"<= reference_low_mg={calibration.reference_low_mg}"
+                    ),
+                    "input": calibration.model_dump(),
+                }
+            ]
+        )
+
+    # 先逐样本做两点线性换算再进入既有裁决链路；
+    # 任一修正重量越界即整体拒绝，不返回部分裁决
+    raw_weights = [s.weight_mg for s in samples]
+    if calibration is None:
+        weights = raw_weights
+    else:
+        weights = []
+        for i, raw in enumerate(raw_weights):
+            corrected = calibrate_weight_mg(
+                raw,
+                calibration.measured_low_mg,
+                calibration.measured_high_mg,
+                calibration.reference_low_mg,
+                calibration.reference_high_mg,
+            )
+            if not WEIGHT_MIN_MG <= corrected <= WEIGHT_MAX_MG:
+                raise RequestValidationError(
+                    [
+                        {
+                            "type": "value_error",
+                            "loc": ["body", "samples", i, "weight_mg"],
+                            "msg": (
+                                "calibrated weight out of range "
+                                f"[{WEIGHT_MIN_MG}, {WEIGHT_MAX_MG}] mg: "
+                                f"samples[{i}].weight_mg={raw} -> {corrected}"
+                            ),
+                            "input": raw,
+                        }
+                    ]
+                )
+            weights.append(corrected)
+
     tare_mg = compute_tare_mg(weights)
 
     platform = find_platform(

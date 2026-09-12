@@ -12,6 +12,39 @@ TARE_SAMPLE_COUNT = 20  # 皮重取前 20 个样本
 MIN_PLATFORM_POINTS = 30  # 平台至少包含的连续样本点数
 MAX_PLATFORM_SPREAD_MG = 4  # 平台内 最大重量 - 最小重量 的上限（毫克）
 
+WEIGHT_MIN_MG = 0
+WEIGHT_MAX_MG = 500_000
+
+
+def calibrate_weight_mg(
+    weight_mg: int,
+    measured_low: int,
+    measured_high: int,
+    reference_low: int,
+    reference_high: int,
+) -> int:
+    """按两点校准证书做线性换算并取整。
+
+    设两点为测量值 (measured_low, measured_high) 与参考值
+    (reference_low, reference_high)，线性公式为：
+
+        corrected = reference_low
+            + (weight_mg - measured_low)
+              * (reference_high - reference_low)
+              / (measured_high - measured_low)
+
+    取最接近的整数毫克；恰好落在两个整数中间（半毫克）时取较大整数。
+    全程整数运算，结果可逐样本复算。
+    """
+    numerator = (
+        reference_low * (measured_high - measured_low)
+        + (weight_mg - measured_low) * (reference_high - reference_low)
+    )
+    denominator = measured_high - measured_low  # 调用方保证 > 0
+    # floor((numerator/denominator) + 1/2)：最近整数，半毫克取较大整数，
+    # 对负值同样成立（向零方向取整）。
+    return (2 * numerator + denominator) // (2 * denominator)
+
 
 def lower_median(values: list[int]) -> int:
     """较小中位数：排序后取下标 (n-1)//2 的元素。

@@ -22,6 +22,7 @@ def make_payload(
     step: int = 100,
     max_sample_gap_ms: int | None = None,
     timestamps: list[int] | None = None,
+    calibration: dict | None = None,
 ) -> dict:
     if timestamps is None:
         timestamps = [start_ts + i * step for i in range(len(weights))]
@@ -35,6 +36,8 @@ def make_payload(
     }
     if max_sample_gap_ms is not None:
         payload["max_sample_gap_ms"] = max_sample_gap_ms
+    if calibration is not None:
+        payload["calibration"] = calibration
     return payload
 
 
@@ -44,6 +47,19 @@ def gapped_timestamps(n: int, gap_after: int, step: int = 100, big_gap: int = 10
     for i in range(1, n):
         ts.append(ts[-1] + (big_gap if i == gap_after + 1 else step))
     return ts
+
+
+# 校准改变平台的样本：前 20 个皮重样本恒为 1000，后续 30 个样本在
+# 6100..6108 间分布（极差 8 > 4），原始数据不存在合格平台。
+# 斜率 1/2 的校准（测量 0..10000 -> 参考 0..5000）把极差压到 4，
+# 平台出现：修正后皮重 500、毛重 3052、净重 2552。
+SPREAD_EIGHT_WEIGHTS = [1000] * 20 + [6100 + (i % 9) for i in range(30)]
+HALF_SLOPE_CALIBRATION = {
+    "measured_low_mg": 0,
+    "measured_high_mg": 10000,
+    "reference_low_mg": 0,
+    "reference_high_mg": 5000,
+}
 
 
 class TestHealth:
@@ -239,6 +255,292 @@ class TestSampleGap:
         )
         assert resp.status_code == 200
         assert resp.json()["verdict"] == "pass"
+
+
+class TestCalibration:
+    def test_calibration_changes_platform_selection_and_verdict(self):
+        # 原始样本极差 8，不存在合格平台 -> 不可判定
+        resp = client.post(URL, json=make_payload(SPREAD_EIGHT_WEIGHTS))
+        assert resp.status_code == 200
+        assert resp.json()["verdict"] == "indeterminate"
+
+        # 同批样本携带两点校准后，修正序列极差被压到 4 -> 出现平台并合格
+        payload = make_payload(
+            SPREAD_EIGHT_WEIGHTS,
+            target=2552,
+            tolerance=0,
+            calibration=HALF_SLOPE_CALIBRATION,
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 20,
+            "platform_end_index": 49,
+            "tare_mg": 500,
+            "gross_mg": 3052,
+            "net_mg": 2552,
+        }
+
+    def test_identity_calibration_leaves_response_unchanged(self):
+        # 测量点与参考点一致：响应与省略校准时逐项相同
+        payload = make_payload(
+            PASSING_WEIGHTS,
+            calibration={
+                "measured_low_mg": 0,
+                "measured_high_mg": 500000,
+                "reference_low_mg": 0,
+                "reference_high_mg": 500000,
+            },
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.json() == client.post(URL, json=make_payload(PASSING_WEIGHTS)).json()
+
+    def test_response_weights_are_recomputable_corrected_values(self):
+        # 测量 0..100 -> 参考 1000..2000：斜率 10、截距 1000
+        weights = [100] * 20 + [510] * 30  # 修正后 2000 与 6100
+        payload = make_payload(
+            weights,
+            target=4100,
+            tolerance=0,
+            calibration={
+                "measured_low_mg": 0,
+                "measured_high_mg": 100,
+                "reference_low_mg": 1000,
+                "reference_high_mg": 2000,
+            },
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 20,
+            "platform_end_index": 49,
+            "tare_mg": 2000,
+            "gross_mg": 6100,
+            "net_mg": 4100,
+        }
+
+    def test_half_milligram_rounding_is_deterministic_upward(self):
+        # 测量 0..2 -> 参考 0..3：修正值 = 原始值 * 3 / 2。
+        # 1001 -> 1501.5 -> 1502（皮重）；6101 -> 9151.5 -> 9152（毛重）；
+        # 净重 = 9152 - 1502 = 7650，恰好半毫克时取较大整数。
+        weights = [1001] * 20 + [6101] * 30
+        calibration = {
+            "measured_low_mg": 0,
+            "measured_high_mg": 2,
+            "reference_low_mg": 0,
+            "reference_high_mg": 3,
+        }
+        first = client.post(URL, json=make_payload(weights, target=7650, tolerance=0,
+                                                   calibration=calibration))
+        assert first.json() == {
+            "verdict": "pass",
+            "platform_start_index": 20,
+            "platform_end_index": 49,
+            "tare_mg": 1502,
+            "gross_mg": 9152,
+            "net_mg": 7650,
+        }
+        # 重复调用完全一致，可复算
+        second = client.post(URL, json=make_payload(weights, target=7650, tolerance=0,
+                                                    calibration=calibration))
+        assert second.json() == first.json()
+        # 目标偏移 1 即不合格，证明净重确实是向上取整后的值而非 7649/7651
+        other = client.post(URL, json=make_payload(weights, target=7649, tolerance=0,
+                                                   calibration=calibration))
+        assert other.json()["verdict"] == "fail"
+
+    def test_calibration_applies_before_tare_and_platform(self):
+        # 校准改变皮重：原始前 20 样本 1000..1019（较小中位数 1009），
+        # 经斜率 2 校准后为 2000..2038（较小中位数 2018）
+        weights = [1000 + i for i in range(20)] + [5000] * 30
+        payload = make_payload(
+            weights,
+            target=7982,
+            tolerance=0,
+            calibration={
+                "measured_low_mg": 0,
+                "measured_high_mg": 250000,
+                "reference_low_mg": 0,
+                "reference_high_mg": 500000,
+            },
+        )
+        body = client.post(URL, json=payload).json()
+        assert body["tare_mg"] == 2018
+        assert body["gross_mg"] == 10000
+        assert body["net_mg"] == 7982
+        assert body["verdict"] == "pass"
+
+
+class TestCalibrationValidation:
+    def test_measured_high_not_greater_than_low_locates_calibration(self):
+        payload = make_payload(
+            PASSING_WEIGHTS,
+            calibration={
+                "measured_low_mg": 100,
+                "measured_high_mg": 100,
+                "reference_low_mg": 0,
+                "reference_high_mg": 500000,
+            },
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "calibration"]
+
+    def test_reference_high_not_greater_than_low_locates_calibration(self):
+        payload = make_payload(
+            PASSING_WEIGHTS,
+            calibration={
+                "measured_low_mg": 0,
+                "measured_high_mg": 500000,
+                "reference_low_mg": 200,
+                "reference_high_mg": 10,
+            },
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "calibration"]
+
+    def test_calibrated_weight_above_max_locates_sample_weight(self):
+        # 斜率 2：样本 300000 -> 修正 600000 越界
+        weights = [1000] * 20 + [300000] * 30
+        payload = make_payload(
+            weights,
+            calibration={
+                "measured_low_mg": 0,
+                "measured_high_mg": 250000,
+                "reference_low_mg": 0,
+                "reference_high_mg": 500000,
+            },
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "samples", 20, "weight_mg"]
+
+    def test_calibrated_weight_below_zero_locates_sample_weight(self):
+        # 测量 1000..2000 -> 参考 0..1000：皮重样本 1000 恰为 0 合法，
+        # 取 999 时修正为 -1 越界
+        weights = [999] * 20 + [1500] * 30
+        payload = make_payload(
+            weights,
+            calibration={
+                "measured_low_mg": 1000,
+                "measured_high_mg": 2000,
+                "reference_low_mg": 0,
+                "reference_high_mg": 1000,
+            },
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "samples", 0, "weight_mg"]
+
+    def test_out_of_range_rejects_entire_batch_no_partial_verdict(self):
+        # 越界出现在最后一个样本：其余样本修正后 400000 合法，400000*2=800000 越界
+        weights = [1000] * 20 + [200000] * 29 + [400000]
+        payload = make_payload(
+            weights,
+            calibration={
+                "measured_low_mg": 0,
+                "measured_high_mg": 250000,
+                "reference_low_mg": 0,
+                "reference_high_mg": 500000,
+            },
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert len(detail) == 1
+        assert detail[0]["loc"] == ["body", "samples", 49, "weight_mg"]
+        assert "verdict" not in resp.json()
+
+    def test_calibration_field_range_and_type_errors(self):
+        base = {
+            "measured_low_mg": 0,
+            "measured_high_mg": 500000,
+            "reference_low_mg": 0,
+            "reference_high_mg": 500000,
+        }
+        for bad_field, bad_value in [
+            ("measured_low_mg", -1),
+            ("measured_high_mg", 500001),
+            ("reference_low_mg", 1.5),
+            ("reference_high_mg", "500000"),
+        ]:
+            calibration = dict(base)
+            calibration[bad_field] = bad_value
+            resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, calibration=calibration))
+            assert resp.status_code == 422
+            assert resp.json()["detail"][0]["loc"] == ["body", "calibration", bad_field]
+
+    def test_extra_calibration_field_rejected(self):
+        payload = make_payload(
+            PASSING_WEIGHTS,
+            calibration={
+                "measured_low_mg": 0,
+                "measured_high_mg": 500000,
+                "reference_low_mg": 0,
+                "reference_high_mg": 500000,
+                "unexpected": 1,
+            },
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "calibration", "unexpected"]
+
+    def test_calibration_null_skips_conversion(self):
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS, calibration=None))
+        # None 等价于省略：按原始重量裁决
+        assert resp.status_code == 200
+        assert resp.json()["net_mg"] == 5102
+
+    def test_omitted_calibration_keeps_pass_response(self):
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS))
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 20,
+            "platform_end_index": 49,
+            "tare_mg": 1000,
+            "gross_mg": 6102,
+            "net_mg": 5102,
+        }
+
+    def test_omitted_calibration_keeps_indeterminate_response(self):
+        weights = [i * 10 for i in range(50)]
+        resp = client.post(URL, json=make_payload(weights))
+        assert resp.json() == {
+            "verdict": "indeterminate",
+            "platform_start_index": None,
+            "platform_end_index": None,
+            "tare_mg": 90,
+            "gross_mg": None,
+            "net_mg": None,
+        }
+
+
+
+class TestCalibrationWithSampleGap:
+    def test_calibration_runs_before_gap_aware_platform_search(self):
+        # 原始极差 8 的两个稳定片段；校准先将极差压到 4，时间断点再阻止跨段拼接。
+        weights = [1000] * 20 + [6100 + (i % 9) for i in range(29)] + [6100 + (i % 9) for i in range(30)]
+        timestamps = gapped_timestamps(len(weights), gap_after=48)
+        payload = make_payload(
+            weights,
+            target=2552,
+            tolerance=0,
+            timestamps=timestamps,
+            max_sample_gap_ms=1000,
+            calibration=HALF_SLOPE_CALIBRATION,
+        )
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 49,
+            "platform_end_index": 78,
+            "tare_mg": 500,
+            "gross_mg": 3052,
+            "net_mg": 2552,
+        }
 
 
 class TestValidation:

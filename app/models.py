@@ -26,6 +26,21 @@ class Sample(BaseModel):
     weight_mg: WeightMg
 
 
+class Calibration(BaseModel):
+    """两点校准证书：测量高低点与参考高低点（毫克，严格整数）。
+
+    测量高点必须大于测量低点，参考高点必须大于参考低点；
+    该交叉字段关系在路由中校验，非法时错误定位到 calibration。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    measured_low_mg: WeightMg
+    measured_high_mg: WeightMg
+    reference_low_mg: WeightMg
+    reference_high_mg: WeightMg
+
+
 class FillCheckRequest(BaseModel):
     """净灌装量判定请求。"""
 
@@ -35,6 +50,7 @@ class FillCheckRequest(BaseModel):
     target_net_mg: TargetNetMg
     tolerance_mg: ToleranceMg
     max_sample_gap_ms: MaxSampleGapMs | None = Field(default=None)
+    calibration: Calibration | None = None
 
 
 class Verdict(str, Enum):

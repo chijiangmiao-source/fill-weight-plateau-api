@@ -6,10 +6,51 @@ from app.core import (
     MAX_PLATFORM_SPREAD_MG,
     MIN_PLATFORM_POINTS,
     TARE_SAMPLE_COUNT,
+    calibrate_weight_mg,
     compute_tare_mg,
     find_platform,
     lower_median,
 )
+
+
+class TestCalibrateWeight:
+    def test_identity_calibration(self):
+        # 测量点与参考点完全一致：重量不变
+        assert calibrate_weight_mg(0, 0, 500_000, 0, 500_000) == 0
+        assert calibrate_weight_mg(123_456, 0, 500_000, 0, 500_000) == 123_456
+        assert calibrate_weight_mg(500_000, 0, 500_000, 0, 500_000) == 500_000
+
+    def test_scale_and_offset(self):
+        # 测量 0..100 -> 参考 1000..2000：斜率 10、截距 1000
+        f = lambda w: calibrate_weight_mg(w, 0, 100, 1000, 2000)
+        assert f(0) == 1000
+        assert f(50) == 1500
+        assert f(100) == 2000
+
+    def test_half_milligram_rounds_up_positive(self):
+        # 测量 0..2 -> 参考 0..3：w=1 时恰为 3/2 = 1.5 毫克，取较大整数 2
+        assert calibrate_weight_mg(1, 0, 2, 0, 3) == 2
+
+    def test_half_milligram_rounds_up_negative(self):
+        # 恰为 9.5 毫克：半毫克仍取较大整数 10，而非 9
+        # 测量 0..4 -> 参考 10..12，w=-1 时为 10 - 1*2/4 = 9.5
+        assert calibrate_weight_mg(-1, 0, 4, 10, 12) == 10
+
+    def test_nearest_integer_not_truncation(self):
+        # 测量 0..3 -> 参考 0..1：w=1 为 1/3 -> 0；w=2 为 2/3 -> 1
+        assert calibrate_weight_mg(1, 0, 3, 0, 1) == 0
+        assert calibrate_weight_mg(2, 0, 3, 0, 1) == 1
+
+    def test_extrapolation_outside_calibration_points(self):
+        # 线性换算对校准点之外同样成立：w=200 -> 3000，w=-50 -> 500
+        f = lambda w: calibrate_weight_mg(w, 0, 100, 1000, 2000)
+        assert f(200) == 3000
+        assert f(-50) == 500
+
+    def test_low_points_need_not_be_zero(self):
+        # 测量 100..200 -> 参考 0..50：w=150 恰为 25
+        assert calibrate_weight_mg(150, 100, 200, 0, 50) == 25
+
 
 
 class TestLowerMedian:
