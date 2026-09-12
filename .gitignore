@@ -1,0 +1,25 @@
+# Python 缓存与字节码
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 构建产物
+build/
+dist/
+
+# 本地环境配置
+.env
+
+# 系统文件
+.DS_Store
