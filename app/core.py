@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Container
 from collections import deque
 
 TARE_SAMPLE_COUNT = 20  # 皮重取前 20 个样本
@@ -67,6 +68,7 @@ def find_platform(
     timestamps_ms: list[int] | None = None,
     max_sample_gap_ms: int | None = None,
     min_platform_duration_ms: int | None = None,
+    excluded_indices: Container[int] | None = None,
 ) -> tuple[int, int] | None:
     """在下标 >= 20 的后续样本中搜索真实平台。
 
@@ -82,6 +84,12 @@ def find_platform(
     覆盖极短瞬间，该时长门槛用于过滤这种伪平台；先按点数与极差形成候选，
     再过滤持续时间不足者。
 
+    当提供 excluded_indices 时，其中的下标（对应设备日志确认的清洗喷射或
+    人工触碰干扰样本）被视为不可跨越的断点：窗口在该样本处整体重置，该点
+    既不参与任何候选平台，其两侧的剩余样本也不能拼成一个平台，平台只能
+    位于断点切出的单个连续片段内。调用方已保证这些下标全部落在平台搜索
+    区域（>= 20）内。
+
     返回 (起始下标, 结束下标)，均为原请求样本数组的零基下标且包含两端；
     不存在合格平台时返回 None。
     """
@@ -94,6 +102,15 @@ def find_platform(
     best_end = -1
 
     for right in range(TARE_SAMPLE_COUNT, n):
+        # 人工确认干扰样本：与采样断点同为不可跨越的硬断点。
+        # 直接丢弃全部窗口状态并跳过该点，从下一个样本重新开段，
+        # 任何平台都不得包含该点或跨越该点拼接。
+        if excluded_indices is not None and right in excluded_indices:
+            left = right + 1
+            min_q.clear()
+            max_q.clear()
+            continue
+
         # 采样断点：right 是断点后的第一个样本，丢弃断点前的全部窗口状态，
         # 从 right 重新开段，保证任何平台都不跨越时间空档。
         if (

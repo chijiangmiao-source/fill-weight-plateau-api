@@ -25,6 +25,7 @@ def make_payload(
     timestamps: list[int] | None = None,
     calibration: dict | None = None,
     min_platform_duration_ms: int | None = None,
+    excluded_ranges: list[dict] | None = None,
 ) -> dict:
     if timestamps is None:
         timestamps = [start_ts + i * step for i in range(len(weights))]
@@ -42,6 +43,8 @@ def make_payload(
         payload["calibration"] = calibration
     if min_platform_duration_ms is not None:
         payload["min_platform_duration_ms"] = min_platform_duration_ms
+    if excluded_ranges is not None:
+        payload["excluded_ranges"] = excluded_ranges
     return payload
 
 
@@ -453,6 +456,377 @@ class TestMinPlatformDurationValidation:
         resp = client.post(URL, json=payload)
         assert resp.status_code == 422
         assert resp.json()["detail"][0]["loc"] == ["body", "unexpected"]
+
+
+class TestExcludedRanges:
+    # 双平台样本：
+    # 区间 A：下标 20..59 共 40 点恒为 6000（原最长平台）；
+    # 下标 60 为尖峰打断窗口；
+    # 区间 B：下标 61..95 共 35 点恒为 6100（次长平台）。
+    TWO_PLATFORM_WEIGHTS = [1000] * 20 + [6000] * 40 + [99999] + [6100] * 35
+
+    def test_excluding_longest_region_selects_second_longest(self):
+        # 验收路径 1：排除原最长区段 A (20..59) 后选中次长平台 B (61..95)
+        assert len(self.TWO_PLATFORM_WEIGHTS) == 96
+        before = client.post(URL, json=make_payload(self.TWO_PLATFORM_WEIGHTS,
+                                                    target=5100, tolerance=0)).json()
+        assert (before["platform_start_index"], before["platform_end_index"]) == (20, 59)
+
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                target=5100,
+                tolerance=10,
+                excluded_ranges=[{"start_index": 20, "end_index": 59}],
+            ),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 61,
+            "platform_end_index": 95,
+            "tare_mg": 1000,
+            "gross_mg": 6100,
+            "net_mg": 5100,
+        }
+
+    def test_excluding_disturbance_inside_single_region_both_sides_under_30(self):
+        # 验收路径 2：单平台 20..78 共 59 点，排除清洗喷射点下标 49 后
+        # 两侧各 29 点均不足 30 -> 不可判定，皮重照常返回，不泄露候选
+        weights = [1000] * 20 + [6000] * 59
+        assert len(weights) == 79
+        resp = client.post(
+            URL,
+            json=make_payload(
+                weights,
+                excluded_ranges=[{"start_index": 49, "end_index": 49}],
+            ),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "indeterminate",
+            "platform_start_index": None,
+            "platform_end_index": None,
+            "tare_mg": 1000,
+            "gross_mg": None,
+            "net_mg": None,
+        }
+
+    def test_range_exclusion_also_breaks_with_no_crossing_platform(self):
+        # 排除一个区段（而非单点）：58 点平台排除 48..49，两侧 28 / 28 点
+        weights = [1000] * 20 + [6000] * 58
+        resp = client.post(
+            URL,
+            json=make_payload(
+                weights,
+                excluded_ranges=[{"start_index": 48, "end_index": 49}],
+            ),
+        )
+        assert resp.json()["verdict"] == "indeterminate"
+
+    def test_multiple_ranges_each_act_as_unbridgeable_break(self):
+        # 两个排除区段把 A 切成两段，B 保持 35 点完整 -> 仍选 B
+        weights = self.TWO_PLATFORM_WEIGHTS
+        resp = client.post(
+            URL,
+            json=make_payload(
+                weights, target=5100, tolerance=0,
+                excluded_ranges=[
+                    {"start_index": 25, "end_index": 35},
+                    {"start_index": 45, "end_index": 55},
+                ],
+            ),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert (body["platform_start_index"], body["platform_end_index"]) == (61, 95)
+
+    def test_twenty_ranges_at_upper_bound_accepted(self):
+        # 上限 20 个区段合法：排除 A 内 20 个不同单点，A 剩余段仍可能短于 B
+        weights = self.TWO_PLATFORM_WEIGHTS
+        ranges = [{"start_index": 20 + 2 * k, "end_index": 20 + 2 * k} for k in range(20)]
+        resp = client.post(
+            URL, json=make_payload(weights, excluded_ranges=ranges)
+        )
+        assert resp.status_code == 200
+        assert (resp.json()["platform_start_index"],
+                resp.json()["platform_end_index"]) == (61, 95)
+
+    def test_excluded_points_are_never_inside_platform(self):
+        # 全部恒值：排除 30..40 后平台不得包含这些点，最长剩余段为 41..99
+        weights = [1000] * 20 + [6000] * 80
+        assert len(weights) == 100
+        resp = client.post(
+            URL,
+            json=make_payload(
+                weights,
+                excluded_ranges=[{"start_index": 30, "end_index": 40}],
+            ),
+        )
+        body = resp.json()
+        assert (body["platform_start_index"], body["platform_end_index"]) == (41, 99)
+        assert not (30 <= body["platform_start_index"] <= 40
+                    or 30 <= body["platform_end_index"] <= 40)
+
+    def test_exclusion_combines_with_sample_gap_and_calibration(self):
+        # 与采样断点、两点校准组合：校准把极差 8 压到 4；时间断点
+        # (48/49) 前 29 点不足，断点后 49..78 共 30 点本可成为平台，
+        # 再排除片段中间点 60 后，剩余 11 / 18 点均不足 -> 不可判定
+        weights = [1000] * 20
+        weights += [6100 + (i % 9) for i in range(29)]
+        weights += [6100 + (i % 9) for i in range(30)]
+        assert len(weights) == 79
+        ts = gapped_timestamps(len(weights), gap_after=48)
+        common = dict(
+            target=2552, tolerance=0, timestamps=ts,
+            calibration=HALF_SLOPE_CALIBRATION,
+        )
+        ok = client.post(
+            URL, json=make_payload(weights, max_sample_gap_ms=1000, **common)
+        )
+        assert (ok.json()["platform_start_index"],
+                ok.json()["platform_end_index"]) == (49, 78)
+        resp = client.post(
+            URL,
+            json=make_payload(
+                weights, max_sample_gap_ms=1000,
+                excluded_ranges=[{"start_index": 60, "end_index": 60}],
+                **common,
+            ),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "indeterminate",
+            "platform_start_index": None,
+            "platform_end_index": None,
+            "tare_mg": 500,
+            "gross_mg": None,
+            "net_mg": None,
+        }
+
+
+class TestExcludedRangesValidation:
+    TWO_PLATFORM_WEIGHTS = TestExcludedRanges.TWO_PLATFORM_WEIGHTS
+
+    @pytest.mark.parametrize(
+        "bad_range,field",
+        [
+            ({"start_index": 50, "end_index": 49}, "start_index"),  # 倒置
+            ({"start_index": 90, "end_index": 96}, "end_index"),    # 越出末尾
+            ({"start_index": 20, "end_index": 50000}, "end_index"),
+            ({"start_index": 19, "end_index": 30}, "start_index"),  # 接触皮重区
+            ({"start_index": 0, "end_index": 19}, "start_index"),
+        ],
+    )
+    def test_invalid_range_gets_precise_field_location(self, bad_range, field):
+        # 验收路径 3：非法区段 422，loc 精确指向对应区段的具体字段
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[bad_range],
+            ),
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert len(detail) == 1
+        assert detail[0]["loc"] == ["body", "excluded_ranges", 0, field]
+        # 整次请求拒绝，不返回部分裁决
+        assert "verdict" not in resp.json()
+
+    def test_overlapping_ranges_located_at_later_range(self):
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[
+                    {"start_index": 30, "end_index": 40},
+                    {"start_index": 40, "end_index": 45},  # 端点相接即重叠
+                ],
+            ),
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == [
+            "body", "excluded_ranges", 1, "start_index"
+        ]
+
+    def test_nested_overlapping_ranges_located_at_later_range(self):
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[
+                    {"start_index": 30, "end_index": 50},
+                    {"start_index": 35, "end_index": 38},
+                ],
+            ),
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == [
+            "body", "excluded_ranges", 1, "start_index"
+        ]
+
+    def test_overlap_check_uses_request_order_not_sorted_order(self):
+        # 请求中先给的区段起点更大：重叠错误仍定位到请求顺序靠后（index 1）的区段
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[
+                    {"start_index": 35, "end_index": 45},
+                    {"start_index": 30, "end_index": 40},
+                ],
+            ),
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == [
+            "body", "excluded_ranges", 1, "start_index"
+        ]
+
+    def test_adjacent_but_not_overlapping_ranges_accepted(self):
+        # 前一段 end=40、后一段 start=41：不重叠，中间没有样本，合法
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[
+                    {"start_index": 30, "end_index": 40},
+                    {"start_index": 41, "end_index": 45},
+                ],
+            ),
+        )
+        assert resp.status_code == 200
+
+    def test_end_index_equal_to_last_sample_is_accepted(self):
+        # 95 是最后一个样本下标：闭区间端点落在数组末尾合法
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[{"start_index": 90, "end_index": 95}],
+            ),
+        )
+        assert resp.status_code == 200
+
+    def test_start_equal_20_is_within_search_region(self):
+        # 20 是平台搜索区域起点：不接触皮重区 [0,19]，合法
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[{"start_index": 20, "end_index": 20}],
+            ),
+        )
+        assert resp.status_code == 200
+
+    @pytest.mark.parametrize("bad_value", [True, False, 1.5, 1.0, "25", None, [25]])
+    def test_index_must_be_strict_integer(self, bad_value):
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[{"start_index": bad_value, "end_index": 40}],
+            ),
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == [
+            "body", "excluded_ranges", 0, "start_index"
+        ]
+
+    def test_extra_field_inside_range_located(self):
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[{"start_index": 30, "end_index": 40, "reason": "rinse"}],
+            ),
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == [
+            "body", "excluded_ranges", 0, "reason"
+        ]
+
+    def test_empty_list_rejected_and_located_at_excluded_ranges(self):
+        resp = client.post(
+            URL, json=make_payload(self.TWO_PLATFORM_WEIGHTS, excluded_ranges=[])
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "excluded_ranges"]
+
+    def test_twenty_one_ranges_rejected_and_located_at_excluded_ranges(self):
+        ranges = [{"start_index": 20 + k, "end_index": 20 + k} for k in range(21)]
+        resp = client.post(
+            URL, json=make_payload(self.TWO_PLATFORM_WEIGHTS, excluded_ranges=ranges)
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "excluded_ranges"]
+
+    def test_wrong_type_rejected_and_located_at_excluded_ranges(self):
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS, excluded_ranges={"start_index": 30}
+            ),
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "excluded_ranges"]
+
+    def test_no_partial_verdict_on_invalid_range(self):
+        # 即使其余样本本可裁决，非法区段也整次拒绝、无任何裁决字段
+        resp = client.post(
+            URL,
+            json=make_payload(
+                self.TWO_PLATFORM_WEIGHTS,
+                excluded_ranges=[{"start_index": 0, "end_index": 49}],
+            ),
+        )
+        assert resp.status_code == 422
+        assert "verdict" not in resp.json()
+        assert "results" not in resp.json()
+
+
+class TestExcludedRangesOmittedUnchanged:
+    def test_omitted_param_keeps_passing_response_identical(self):
+        # 验收路径 4：省略 excluded_ranges 的合格请求与原响应逐字段一致
+        resp = client.post(URL, json=make_payload(PASSING_WEIGHTS))
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "verdict": "pass",
+            "platform_start_index": 20,
+            "platform_end_index": 49,
+            "tare_mg": 1000,
+            "gross_mg": 6102,
+            "net_mg": 5102,
+        }
+
+    def test_explicit_null_equivalent_to_omitted(self):
+        payload = make_payload(PASSING_WEIGHTS)
+        payload["excluded_ranges"] = None
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == client.post(URL, json=make_payload(PASSING_WEIGHTS)).json()
+
+    def test_omitted_param_multi_candidate_response_identical(self):
+        weights = TestExcludedRanges.TWO_PLATFORM_WEIGHTS
+        payload = make_payload(weights, target=5000, tolerance=0)
+        assert "excluded_ranges" not in payload
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert (resp.json()["platform_start_index"],
+                resp.json()["platform_end_index"]) == (20, 59)
+
+    def test_omitted_param_indeterminate_response_identical(self):
+        weights = [i * 10 for i in range(50)]
+        resp = client.post(URL, json=make_payload(weights))
+        assert resp.json() == {
+            "verdict": "indeterminate",
+            "platform_start_index": None,
+            "platform_end_index": None,
+            "tare_mg": 90,
+            "gross_mg": None,
+            "net_mg": None,
+        }
 
 
 class TestCalibration:

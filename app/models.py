@@ -43,6 +43,26 @@ class Calibration(BaseModel):
     reference_high_mg: WeightMg
 
 
+# 排除区段端点：原样本数组的零基下标，严格整数；
+# 具体取值范围（必须落在平台搜索区域）在服务中按实际样本数校验
+SampleIndex = Annotated[int, Field(strict=True, ge=0, le=19_999)]
+
+
+class ExcludedRange(BaseModel):
+    """排除区段：设备日志确认的清洗喷射 / 人工触碰干扰样本。
+
+    start_index / end_index 均指向原样本数组，包含两端；
+    必须满足 start_index <= end_index 且整体落在平台搜索区域
+    （下标 >= 20）内，区段之间不得重叠或接触皮重区域。
+    这些交叉约束在服务中校验，非法时错误定位到对应区段字段。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_index: SampleIndex
+    end_index: SampleIndex
+
+
 class FillCheckRequest(BaseModel):
     """净灌装量判定请求。"""
 
@@ -54,6 +74,10 @@ class FillCheckRequest(BaseModel):
     max_sample_gap_ms: MaxSampleGapMs | None = Field(default=None)
     min_platform_duration_ms: MinPlatformDurationMs | None = Field(default=None)
     calibration: Calibration | None = None
+    # 1 ~ 20 个已知干扰区段；省略或为 null 时不排除任何样本，
+    # 裁决与引入该字段前逐项一致。区段的倒置 / 越界 / 重叠 /
+    # 接触皮重区域由服务整体校验，整次请求 422，不做部分裁决。
+    excluded_ranges: list[ExcludedRange] | None = Field(default=None, min_length=1, max_length=20)
 
 
 class Verdict(str, Enum):

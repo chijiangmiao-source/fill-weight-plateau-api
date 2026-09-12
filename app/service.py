@@ -15,6 +15,7 @@ from __future__ import annotations
 from fastapi.exceptions import RequestValidationError
 
 from app.core import (
+    TARE_SAMPLE_COUNT,
     WEIGHT_MAX_MG,
     WEIGHT_MIN_MG,
     calibrate_weight_mg,
@@ -37,6 +38,85 @@ def _raise_validation_error(loc: tuple, msg: str, value: object) -> None:
             }
         ]
     )
+
+
+def _validate_excluded_ranges(
+    request: FillCheckRequest,
+    sample_count: int,
+    loc_prefix: tuple[str | int, ...],
+    label_prefix: str,
+) -> set[int]:
+    """校验排除区段并展开为被排除的原样本下标集合。
+
+    区段必须满足：
+    - start_index <= end_index（不倒置）；
+    - end_index < 实际样本数（不越出数组末尾）；
+    - start_index >= 20（不接触皮重区域：皮重始终取前 20 个样本）；
+    - 任意两个区段互不重叠。
+    任一条件不满足即整体 422，错误定位到对应区段的具体字段
+    （批量时自动带 checks[i] 前缀），不产生部分裁决。
+    """
+    excluded: set[int] = set()
+    ranges = request.excluded_ranges
+    if not ranges:
+        return excluded
+
+    last_valid_index = sample_count - 1
+    for i, rng in enumerate(ranges):
+        base_loc = (*loc_prefix, "excluded_ranges", i)
+        path = f"{label_prefix}excluded_ranges[{i}]"
+        if rng.start_index > rng.end_index:
+            _raise_validation_error(
+                (*base_loc, "start_index"),
+                (
+                    f"{path}.start_index must be <= end_index: "
+                    f"start_index={rng.start_index} > end_index={rng.end_index}"
+                ),
+                rng.start_index,
+            )
+        if rng.start_index < TARE_SAMPLE_COUNT:
+            _raise_validation_error(
+                (*base_loc, "start_index"),
+                (
+                    f"{path}.start_index must be within the platform search "
+                    f"region (index >= {TARE_SAMPLE_COUNT}); ranges must not "
+                    f"touch the tare samples [0, {TARE_SAMPLE_COUNT - 1}]: "
+                    f"start_index={rng.start_index}"
+                ),
+                rng.start_index,
+            )
+        if rng.end_index > last_valid_index:
+            _raise_validation_error(
+                (*base_loc, "end_index"),
+                (
+                    f"{path}.end_index must be within the sample array "
+                    f"[0, {last_valid_index}]: end_index={rng.end_index}"
+                ),
+                rng.end_index,
+            )
+
+    # 重叠（含端点相接）校验：按请求顺序两两比较，后出现的区段与任一
+    # 更靠前的区段首尾相接即拒绝，并定位到后出现的区段，
+    # 使调用方按请求中的下标即可找到待修正项。区段数 <= 20，直接两两比较。
+    for i in range(1, len(ranges)):
+        cur = ranges[i]
+        for j in range(i):
+            prev = ranges[j]
+            if cur.start_index <= prev.end_index and cur.end_index >= prev.start_index:
+                _raise_validation_error(
+                    (*loc_prefix, "excluded_ranges", i, "start_index"),
+                    (
+                        f"{label_prefix}excluded_ranges[{i}] "
+                        f"[{cur.start_index}, {cur.end_index}] overlaps "
+                        f"excluded_ranges[{j}] [{prev.start_index}, "
+                        f"{prev.end_index}]"
+                    ),
+                    cur.start_index,
+                )
+
+    for rng in ranges:
+        excluded.update(range(rng.start_index, rng.end_index + 1))
+    return excluded
 
 
 def adjudicate(
@@ -69,6 +149,12 @@ def adjudicate(
             )
 
     timestamps = [s.timestamp_ms for s in samples]
+
+    # 排除区段校验（倒置 / 接触皮重区 / 越界 / 重叠）：整次请求 422，
+    # 不返回部分裁决；省略或为 null 时展开为空集，裁决与既有行为逐项一致。
+    excluded_indices = _validate_excluded_ranges(
+        request, len(samples), loc_prefix, label_prefix
+    )
 
     # 两点校准关系校验：测量高点、参考高点必须分别严格大于各自低点
     calibration = request.calibration
@@ -123,6 +209,7 @@ def adjudicate(
         timestamps_ms=timestamps,
         max_sample_gap_ms=request.max_sample_gap_ms,
         min_platform_duration_ms=request.min_platform_duration_ms,
+        excluded_indices=excluded_indices,
     )
     if platform is None:
         # 无合格平台：明确返回不可判定，不猜任何值

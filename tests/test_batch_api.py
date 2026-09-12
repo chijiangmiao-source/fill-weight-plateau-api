@@ -121,6 +121,28 @@ class TestBatchVerdictOrder:
             "pass",
         ]
 
+    def test_excluded_ranges_match_single_endpoint(self):
+        # 排除区段在批量入口与单次入口逐项一致：
+        # 双平台样本排除最长区段后选中次长平台；另一项排除后不可判定
+        two_platform = [1000] * 20 + [6000] * 40 + [99999] + [6100] * 35
+        checks = [
+            make_payload(
+                two_platform, target=5100, tolerance=10,
+                excluded_ranges=[{"start_index": 20, "end_index": 59}],
+            ),
+            make_payload(
+                [1000] * 20 + [6000] * 59,
+                excluded_ranges=[{"start_index": 49, "end_index": 49}],
+            ),
+        ]
+        single = [client.post(URL, json=c).json() for c in checks]
+        resp = client.post(BATCH_URL, json={"checks": checks})
+        assert resp.status_code == 200
+        assert resp.json()["results"] == single
+        assert (single[0]["platform_start_index"],
+                single[0]["platform_end_index"]) == (61, 95)
+        assert single[1]["verdict"] == "indeterminate"
+
     def test_single_check_at_lower_bound(self):
         resp = client.post(BATCH_URL, json={"checks": [PASS_CHECK]})
         assert resp.status_code == 200
@@ -231,6 +253,40 @@ class TestBatchAtomicValidation:
         assert resp.status_code == 422
         assert resp.json()["detail"][0]["loc"] == [
             "body", "checks", 2, "samples", 0, "weight_mg"
+        ]
+        assert "results" not in resp.json()
+
+    def test_invalid_excluded_range_locates_checks_index_and_field(self):
+        # checks[1] 的排除区段接触皮重区（start_index=19）：
+        # 整批 422，loc 同时携带 checks 下标、区段下标与具体字段
+        checks = [copy.deepcopy(PASS_CHECK)]
+        checks.append(
+            make_payload(
+                PASSING_WEIGHTS,
+                excluded_ranges=[{"start_index": 19, "end_index": 30}],
+            )
+        )
+        resp = client.post(BATCH_URL, json={"checks": checks})
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == [
+            "body", "checks", 1, "excluded_ranges", 0, "start_index"
+        ]
+        assert "results" not in resp.json()
+
+    def test_overlapping_excluded_ranges_locates_checks_index(self):
+        checks = [
+            make_payload(
+                PASSING_WEIGHTS,
+                excluded_ranges=[
+                    {"start_index": 25, "end_index": 35},
+                    {"start_index": 30, "end_index": 40},
+                ],
+            )
+        ]
+        resp = client.post(BATCH_URL, json={"checks": checks})
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == [
+            "body", "checks", 0, "excluded_ranges", 1, "start_index"
         ]
         assert "results" not in resp.json()
 

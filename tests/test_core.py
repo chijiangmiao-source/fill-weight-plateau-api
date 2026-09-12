@@ -296,3 +296,89 @@ class TestFindPlatformWithMinDuration:
             max_sample_gap_ms=1000,
             min_platform_duration_ms=1000,
         ) == (55, 84)
+
+
+class TestFindPlatformWithExcludedRanges:
+    def test_excluding_longest_region_selects_next_longest(self):
+        # 区间 A：下标 20..59 共 40 点（最长）；下标 60 为尖峰；
+        # 区间 B：下标 61..95 共 35 点（次长）。排除 A 整段后只能选 B。
+        weights = [1000] * 20 + [2000] * 40 + [99999] + [3000] * 35
+        assert len(weights) == 96
+        assert find_platform(weights) == (20, 59)
+        excluded = set(range(20, 60))
+        assert find_platform(weights, excluded_indices=excluded) == (61, 95)
+
+    def test_excluded_point_is_unbridgeable_break_both_sides_under_30(self):
+        # 下标 20..78 共 59 个恒值点，排除正中间下标 49：
+        # 左侧 20..48 共 29 点、右侧 50..78 共 29 点，均不足 30 -> None
+        weights = [1000] * 20 + [2000] * 59
+        assert len(weights) == 79
+        assert find_platform(weights) == (20, 78)
+        assert find_platform(weights, excluded_indices={49}) is None
+
+    def test_excluded_range_splits_region_into_two_short_segments(self):
+        # 58 个恒值点 (20..77)，排除 48..49：左 28 点、右 28 点 -> None
+        weights = [1000] * 20 + [2000] * 58
+        assert find_platform(weights, excluded_indices={48, 49}) is None
+
+    def test_longest_surviving_segment_wins(self):
+        # 排除区段把后续样本切成 30 / 40 两段，跨段拼凑被禁止 -> 选 40 点段
+        weights = [1000] * 20 + [2000] * 30 + [99999] + [3000] * 40
+        assert len(weights) == 91
+        # 排除左段 20..49 与尖峰 50
+        excluded = set(range(20, 51))
+        assert find_platform(weights, excluded_indices=excluded) == (51, 90)
+
+    def test_excluded_indices_never_part_of_platform(self):
+        # 被排除的点即使重量平稳也不能出现在结果区间内：
+        # 全部恒值，排除 30..40 后最长剩余段为 41..99
+        weights = [1000] * 20 + [2000] * 80
+        assert len(weights) == 100
+        result = find_platform(weights, excluded_indices=set(range(30, 41)))
+        assert result == (41, 99)
+        start, end = result
+        assert not (set(range(start, end + 1)) & set(range(30, 41)))
+
+    def test_tie_between_segments_keeps_earliest_start(self):
+        # 两个等长 30 点片段被排除点隔开：并列选起点更早者
+        weights = [1000] * 20 + [2000] * 30 + [2000] * 30
+        assert len(weights) == 80
+        assert find_platform(weights, excluded_indices={50}) == (20, 49)
+
+    def test_excluding_first_search_sample_starts_after_it(self):
+        # 下标 20 被排除：剩余 21..49 共 29 点不足 -> None（样本恰好 50 个）
+        weights = [1000] * 20 + [2000] * 30
+        assert find_platform(weights, excluded_indices={20}) is None
+        # 多一个样本后 21..50 共 30 点 -> 平台 (21, 50)
+        weights_long = [1000] * 20 + [2000] * 31
+        assert find_platform(weights_long, excluded_indices={20}) == (21, 50)
+
+    def test_excluding_last_sample_is_accepted(self):
+        weights = [1000] * 20 + [2000] * 30
+        assert find_platform(weights, excluded_indices={49}) is None  # 仅剩 29 点
+        weights_long = [1000] * 20 + [2000] * 31
+        assert find_platform(weights_long, excluded_indices={50}) == (20, 49)
+
+    def test_core_treats_any_excluded_index_as_break_indifferently(self):
+        # 核心对任意下标集合一视同仁（搜索区边界由 service 保证）：
+        # 排除平稳段内一点后，剩余长段 (26, 75) 共 50 点成为平台
+        weights = [1000] * 20 + [2000] * 56
+        assert len(weights) == 76
+        assert find_platform(weights, excluded_indices=frozenset({25})) == (26, 75)
+
+    def test_empty_exclusion_set_matches_omitted(self):
+        weights = [1000] * 20 + [2000] * 30
+        assert find_platform(weights, excluded_indices=set()) == (20, 49)
+        assert find_platform(weights, excluded_indices=None) == (20, 49)
+
+    def test_exclusion_combines_with_sample_gap(self):
+        # 时间断点 (48/49) 与排除点 (60) 同时存在：
+        # 20..48 共 29 点（不足），49..78 中排除 60 后切成 11 / 18 点（均不足）-> None
+        weights = [1000] * 20 + [2000] * 59
+        assert len(weights) == 79
+        ts = timestamps_with_gap(len(weights), gap_after=48)
+        assert find_platform(
+            weights, ts, max_sample_gap_ms=1000, excluded_indices={60}
+        ) is None
+        # 不排除 60 时断点后片段 49..78 共 30 点成立
+        assert find_platform(weights, ts, max_sample_gap_ms=1000) == (49, 78)
